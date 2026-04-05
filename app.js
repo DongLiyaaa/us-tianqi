@@ -805,7 +805,7 @@ async function warmMapInsights(runId, { overlayVisible = false, totalStates = st
   let overlayShown = overlayVisible;
   const pendingStates = states.filter((state) => !getResolvedInsight(state.key, personaKey));
 
-  await runWithConcurrency(pendingStates, 10, async (state) => {
+  await runWithConcurrency(pendingStates, 18, async (state) => {
     if (runId !== syncRunId) {
       return;
     }

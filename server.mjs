@@ -1,5 +1,6 @@
 import { createServer } from "node:http";
 import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { once } from "node:events";
 import { extname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -10,7 +11,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = normalize(join(__filename, ".."));
 const weatherCache = {};
 const fileCacheDir = join(__dirname, ".cache", "weather");
-const port = Number(process.env.PORT || 4173);
+const preferredPort = Number(process.env.PORT || 4173);
 
 const contentTypes = {
   ".html": "text/html; charset=utf-8",
@@ -533,6 +534,41 @@ const server = createServer(async (req, res) => {
   return serveStatic(req, res, url.pathname);
 });
 
-server.listen(port, "127.0.0.1", () => {
-  console.log(`Server running at http://127.0.0.1:${port}`);
-});
+async function listenWithFallback(host, startPort) {
+  let currentPort = startPort;
+
+  while (true) {
+    try {
+      await new Promise((resolve, reject) => {
+        const handleListening = () => {
+          server.off("error", handleError);
+          resolve();
+        };
+        const handleError = (error) => {
+          server.off("listening", handleListening);
+          reject(error);
+        };
+
+        server.once("listening", handleListening);
+        server.once("error", handleError);
+        server.listen(currentPort, host);
+      });
+      return currentPort;
+    } catch (error) {
+      if (error?.code !== "EADDRINUSE") {
+        throw error;
+      }
+
+      currentPort += 1;
+    }
+  }
+}
+
+listenWithFallback("127.0.0.1", preferredPort)
+  .then((activePort) => {
+    console.log(`Server running at http://127.0.0.1:${activePort}`);
+  })
+  .catch((error) => {
+    console.error("Failed to start server:", error);
+    process.exitCode = 1;
+  });
