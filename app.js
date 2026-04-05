@@ -87,9 +87,9 @@ let usaMapData = null;
 let autoModelConfig = null;
 
 const seriesMeta = [
-  { key: "temperature", label: "温度", className: "line-temp", color: "#d26f31" },
-  { key: "apparentTemperature", label: "体感温度", className: "line-feels", color: "#b6902f" },
-  { key: "humidity", label: "湿度", className: "line-humidity", color: "#2f7a53" }
+  { key: "temperature", label: "温度", className: "line-temp", color: "#3b82f6" },
+  { key: "apparentTemperature", label: "体感温度", className: "line-feels", color: "#22d3ee" },
+  { key: "humidity", label: "湿度", className: "line-humidity", color: "#8b5cf6" }
 ];
 
 const weatherCodeLabels = {
