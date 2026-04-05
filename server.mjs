@@ -1,17 +1,19 @@
 import { createServer } from "node:http";
 import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { once } from "node:events";
+import { homedir } from "node:os";
 import { extname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { getInsight, personas, states, tierLabel } from "./demand-engine.mjs";
 import { stateCentroids } from "./state-centroids.mjs";
+import usaMapData from "./usa-map-data.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = normalize(join(__filename, ".."));
 const weatherCache = {};
 const fileCacheDir = join(__dirname, ".cache", "weather");
-const preferredPort = Number(process.env.PORT || 4173);
+const preferredPort = Number(process.env.PORT || 4200);
 
 const contentTypes = {
   ".html": "text/html; charset=utf-8",
@@ -41,6 +43,14 @@ async function readJsonBody(req) {
   return JSON.parse(raw);
 }
 
+async function readJsonFileSafe(filePath) {
+  try {
+    return JSON.parse(await readFile(filePath, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
 function notFound(res, message = "Not found") {
   json(res, 404, { error: message });
 }
@@ -54,6 +64,80 @@ function normalizeBaseUrl(baseUrl = "") {
     return `${trimmed}/chat/completions`;
   }
   return `${trimmed}/chat/completions`;
+}
+
+function parseModelReference(modelReference = "") {
+  const [provider, ...rest] = String(modelReference).split("/");
+  const modelId = rest.join("/");
+  if (!provider || !modelId) {
+    return null;
+  }
+  return { provider, modelId };
+}
+
+function publicModelConfig(config = null) {
+  if (!config) {
+    return { ok: false, source: "none" };
+  }
+
+  return {
+    ok: true,
+    source: config.source,
+    provider: config.provider || null,
+    modelId: config.modelId,
+    baseUrl: config.baseUrl,
+    label: config.label || config.modelId
+  };
+}
+
+async function loadOpenClawModelConfig() {
+  const baseHome = homedir();
+  const agentId = process.env.OPENCLAW_AGENT_ID || "main";
+  const openClawConfigPath = process.env.OPENCLAW_CONFIG_PATH || join(baseHome, ".openclaw", "openclaw.json");
+  const openClawModelsPath = process.env.OPENCLAW_MODELS_PATH || join(baseHome, ".openclaw", "agents", agentId, "agent", "models.json");
+
+  const [openClawConfig, openClawModels] = await Promise.all([
+    readJsonFileSafe(openClawConfigPath),
+    readJsonFileSafe(openClawModelsPath)
+  ]);
+
+  const modelReference = openClawConfig?.agents?.defaults?.model?.primary;
+  const parsedReference = parseModelReference(modelReference);
+  if (!parsedReference) {
+    return null;
+  }
+
+  const providerConfig = openClawConfig?.models?.providers?.[parsedReference.provider]
+    || openClawModels?.providers?.[parsedReference.provider];
+  if (!providerConfig?.baseUrl || !providerConfig?.apiKey) {
+    return null;
+  }
+
+  const modelDefinition = providerConfig.models?.find((model) => model.id === parsedReference.modelId);
+
+  return {
+    source: "openclaw",
+    provider: parsedReference.provider,
+    modelId: parsedReference.modelId,
+    baseUrl: providerConfig.baseUrl,
+    apiKey: providerConfig.apiKey,
+    label: modelDefinition?.name || parsedReference.modelId
+  };
+}
+
+async function resolveRequestedModelConfig(input = {}) {
+  if (input.baseUrl && input.modelId && input.apiKey) {
+    return {
+      source: "manual",
+      provider: "manual",
+      modelId: input.modelId,
+      baseUrl: input.baseUrl,
+      apiKey: input.apiKey,
+      label: input.modelId
+    };
+  }
+
+  return loadOpenClawModelConfig();
 }
 
 function extractJsonObject(text) {
@@ -447,24 +531,43 @@ const server = createServer(async (req, res) => {
   }
 
   if (url.pathname === "/api/health") {
-    return json(res, 200, { ok: true, service: "seasonal-demand-api", date: new Date().toISOString() });
+    const host = req.headers.host || fallbackHost;
+    const port = String(host).split(":")[1] || String(req.socket.localPort || preferredPort);
+    return json(res, 200, {
+      ok: true,
+      service: "seasonal-demand-api",
+      date: new Date().toISOString(),
+      host,
+      port,
+      origin: `http://${host}`
+    });
   }
 
   if (url.pathname === "/api/meta") {
     return handleStates(req, res);
   }
 
+  if (url.pathname === "/api/map-data") {
+    return json(res, 200, usaMapData);
+  }
+
+  if (url.pathname === "/api/model/effective") {
+    const config = await loadOpenClawModelConfig();
+    return json(res, 200, publicModelConfig(config));
+  }
+
   if (req.method === "POST" && url.pathname === "/api/model/test") {
     try {
-      const { baseUrl, modelId, apiKey } = await readJsonBody(req);
-      if (!baseUrl || !modelId || !apiKey) {
-        return json(res, 400, { ok: false, error: "缺少 Base URL、模型 ID 或密钥。" });
+      const requestedConfig = await readJsonBody(req);
+      const modelConfig = await resolveRequestedModelConfig(requestedConfig);
+      if (!modelConfig) {
+        return json(res, 400, { ok: false, error: "缺少模型配置，且未找到 OpenClaw 默认模型。" });
       }
 
       await requestModel({
-        baseUrl,
-        modelId,
-        apiKey,
+        baseUrl: modelConfig.baseUrl,
+        modelId: modelConfig.modelId,
+        apiKey: modelConfig.apiKey,
         maxTokens: 32,
         messages: [
           { role: "system", content: "You are a connectivity checker." },
@@ -472,7 +575,11 @@ const server = createServer(async (req, res) => {
         ]
       });
 
-      return json(res, 200, { ok: true, message: "连接成功" });
+      return json(res, 200, {
+        ok: true,
+        message: "连接成功",
+        config: publicModelConfig(modelConfig)
+      });
     } catch (error) {
       return json(res, 200, {
         ok: false,
@@ -484,9 +591,10 @@ const server = createServer(async (req, res) => {
 
   if (req.method === "POST" && url.pathname === "/api/model/analyze") {
     try {
-      const { baseUrl, modelId, apiKey, viewModel } = await readJsonBody(req);
-      if (!baseUrl || !modelId || !apiKey || !viewModel) {
-        return json(res, 400, { ok: false, error: "缺少模型配置或分析数据。" });
+      const { viewModel, ...requestedConfig } = await readJsonBody(req);
+      const modelConfig = await resolveRequestedModelConfig(requestedConfig);
+      if (!modelConfig || !viewModel) {
+        return json(res, 400, { ok: false, error: "缺少分析数据，且未找到可用模型配置。" });
       }
 
       const prompt = [
@@ -507,9 +615,9 @@ const server = createServer(async (req, res) => {
       ].join("\n");
 
       const content = await requestModel({
-        baseUrl,
-        modelId,
-        apiKey,
+        baseUrl: modelConfig.baseUrl,
+        modelId: modelConfig.modelId,
+        apiKey: modelConfig.apiKey,
         maxTokens: 600,
         messages: [
           { role: "system", content: "你只返回合法 JSON。" },
@@ -517,7 +625,11 @@ const server = createServer(async (req, res) => {
         ]
       });
 
-      return json(res, 200, { ok: true, insight: extractJsonObject(content) });
+      return json(res, 200, {
+        ok: true,
+        insight: extractJsonObject(content),
+        config: publicModelConfig(modelConfig)
+      });
     } catch (error) {
       return json(res, 200, {
         ok: false,

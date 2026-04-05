@@ -6,7 +6,6 @@ import {
   states,
   tierLabel
 } from "./demand-engine.mjs";
-import usaMapData from "./usa-map-data.js";
 
 const weatherCache = {};
 const insightCache = {};
@@ -60,6 +59,9 @@ const modelReminder = document.getElementById("modelReminder");
 const decisionOutputSummary = document.getElementById("decisionOutputSummary");
 const dataTimeNote = document.getElementById("dataTimeNote");
 const signalLevel = document.getElementById("signalLevel");
+const runtimeNote = document.getElementById("runtimeNote");
+const runtimeOrigin = document.getElementById("runtimeOrigin");
+const runtimeApiStatus = document.getElementById("runtimeApiStatus");
 const weatherBadge = document.getElementById("weatherBadge");
 const spotlightTitle = document.getElementById("spotlightTitle");
 const intensityBar = document.getElementById("intensityBar");
@@ -81,6 +83,8 @@ let latestModelConnectionState = "unknown";
 let syncRunId = 0;
 let analysisOverlayDepth = 0;
 let activeAnalysisStateName = "";
+let usaMapData = null;
+let autoModelConfig = null;
 
 const seriesMeta = [
   { key: "temperature", label: "温度", className: "line-temp", color: "#d26f31" },
@@ -159,6 +163,27 @@ function loadModelConfig() {
 
 function hasModelConfig(config = loadModelConfig()) {
   return Boolean(config.baseUrl && config.modelId && config.apiKey);
+}
+
+function getEffectiveModelConfig(configOverride = null) {
+  if (configOverride && hasModelConfig(configOverride)) {
+    return { ...configOverride, source: "manual", provider: "manual", label: configOverride.modelId };
+  }
+
+  const manualConfig = loadModelConfig();
+  if (hasModelConfig(manualConfig)) {
+    return { ...manualConfig, source: "manual", provider: "manual", label: manualConfig.modelId };
+  }
+
+  if (autoModelConfig?.ok) {
+    return autoModelConfig;
+  }
+
+  return null;
+}
+
+function hasEffectiveModelConfig(configOverride = null) {
+  return Boolean(getEffectiveModelConfig(configOverride));
 }
 
 function saveModelConfig(config) {
@@ -306,7 +331,46 @@ function getPersonaOptions() {
   return [...personas, ...customPersonas];
 }
 
-function renderUsMap() {
+function hasValidUsaMapData(payload) {
+  return Boolean(
+    payload
+    && Array.isArray(payload.locations)
+    && payload.locations.length
+    && payload.locations.every((location) => {
+      return location
+        && typeof location.id === "string"
+        && typeof location.name === "string"
+        && typeof location.path === "string"
+        && location.path.trim().startsWith("M");
+    })
+  );
+}
+
+async function loadUsaMapData() {
+  if (hasValidUsaMapData(usaMapData)) {
+    return usaMapData;
+  }
+
+  const response = await fetch("/api/map-data", {
+    cache: "no-store",
+    headers: {
+      Accept: "application/json"
+    }
+  });
+  if (!response.ok) {
+    throw new Error(`地图数据加载失败：HTTP ${response.status}`);
+  }
+
+  const payload = await response.json();
+  if (!hasValidUsaMapData(payload)) {
+    throw new Error("地图数据缺少有效 SVG 路径。");
+  }
+
+  usaMapData = payload;
+  return usaMapData;
+}
+
+function renderUsMap(mapData) {
   const namespace = "http://www.w3.org/2000/svg";
   const labelOverrides = {
     dc: { dx: 22, dy: -4, anchor: "start" },
@@ -335,7 +399,7 @@ function renderUsMap() {
   labelGroup.setAttribute("class", "state-label-layer");
   const labelEntries = [];
 
-  usaMapData.locations
+  mapData.locations
     .forEach((location) => {
       const path = document.createElementNS(namespace, "path");
       path.setAttribute("d", location.path);
@@ -405,6 +469,15 @@ function renderUsMap() {
   );
 }
 
+function renderMapLoadError(message) {
+  mapFrame.innerHTML = `
+    <div class="map-load-error">
+      <strong>地图加载失败</strong>
+      <p>${message}</p>
+    </div>
+  `;
+}
+
 async function getCachedInsight(stateKey, personaKey) {
   const cacheKey = `${personaKey}:${stateKey}`;
   if (insightCache[cacheKey]) {
@@ -469,8 +542,18 @@ function normalizeBaseUrl(baseUrl) {
   return `${trimmed}/chat/completions`;
 }
 
-function buildModelInsightCacheKey(viewModel, config = loadModelConfig()) {
+function buildModelInsightCacheKey(viewModel, config = getEffectiveModelConfig()) {
+  if (!config) {
+    return JSON.stringify({
+      source: "none",
+      state: viewModel.state.key,
+      persona: viewModel.persona.key
+    });
+  }
+
   return JSON.stringify({
+    source: config.source || "manual",
+    provider: config.provider || "manual",
     baseUrl: normalizeBaseUrl(config.baseUrl),
     modelId: config.modelId,
     state: viewModel.state.key,
@@ -491,26 +574,51 @@ function buildModelInsightCacheKey(viewModel, config = loadModelConfig()) {
   });
 }
 
-async function testModelConnection(config = loadModelConfig()) {
-  if (!hasModelConfig(config)) {
+async function loadAutoModelConfig() {
+  try {
+    const response = await fetch("/api/model/effective", {
+      cache: "no-store",
+      headers: {
+        Accept: "application/json"
+      }
+    });
+    if (!response.ok) {
+      autoModelConfig = null;
+      return null;
+    }
+    const payload = await response.json();
+    autoModelConfig = payload?.ok ? payload : null;
+    return autoModelConfig;
+  } catch {
+    autoModelConfig = null;
+    return null;
+  }
+}
+
+async function testModelConnection(config = null) {
+  const effectiveConfig = getEffectiveModelConfig(config);
+  if (!effectiveConfig) {
     latestModelConnectionState = "missing";
     return {
       ok: false,
-      message: "缺少 Base URL、模型 ID 或密钥。"
+      message: "缺少 Base URL、模型 ID 或密钥，且未检测到 OpenClaw 默认模型。"
     };
   }
 
   try {
+    const requestBody = effectiveConfig.source === "openclaw"
+      ? { source: "openclaw" }
+      : {
+          baseUrl: effectiveConfig.baseUrl,
+          modelId: effectiveConfig.modelId,
+          apiKey: effectiveConfig.apiKey
+        };
     const response = await fetch("/api/model/test", {
       method: "POST",
       headers: {
         "Content-Type": "application/json"
       },
-      body: JSON.stringify({
-        baseUrl: config.baseUrl,
-        modelId: config.modelId,
-        apiKey: config.apiKey
-      })
+      body: JSON.stringify(requestBody)
     });
 
     const payload = await response.json();
@@ -537,8 +645,8 @@ async function testModelConnection(config = loadModelConfig()) {
 }
 
 async function analyzeWithConfiguredModel(viewModel) {
-  const config = loadModelConfig();
-  if (!hasModelConfig(config)) {
+  const config = getEffectiveModelConfig();
+  if (!config) {
     return limitInsightText(viewModel.insight);
   }
 
@@ -576,12 +684,16 @@ async function analyzeWithConfiguredModel(viewModel) {
         headers: {
           "Content-Type": "application/json"
         },
-        body: JSON.stringify({
-          baseUrl: config.baseUrl,
-          modelId: config.modelId,
-          apiKey: config.apiKey,
-          viewModel
-        })
+        body: JSON.stringify(
+          config.source === "openclaw"
+            ? { source: "openclaw", viewModel }
+            : {
+                baseUrl: config.baseUrl,
+                modelId: config.modelId,
+                apiKey: config.apiKey,
+                viewModel
+              }
+        )
       });
 
       const payload = await response.json();
@@ -681,7 +793,7 @@ function updateHotspotState(activeKey, activeViewModel) {
       path.classList.add(getTierClass(resolvedInsight.level));
       return;
     }
-    if (hasModelConfig()) {
+    if (hasEffectiveModelConfig()) {
       path.classList.add("is-pending");
     }
     const cached = insightCache[getInsightStateKey(appState.activePersona, stateKey)];
@@ -704,11 +816,17 @@ function updatePersonaState() {
 }
 
 function renderModelConfigStatus(configOverride = null, preserveDraft = false) {
-  const config = configOverride || loadModelConfig();
-  const configured = hasModelConfig(config);
-  modelConfigStatus.textContent = hasModelConfig(config)
-    ? `${config.modelId}`
-    : "未配置";
+  const manualConfig = configOverride || loadModelConfig();
+  const manualConfigured = hasModelConfig(manualConfig);
+  const effectiveConfig = manualConfigured
+    ? { ...manualConfig, source: "manual", provider: "manual", label: manualConfig.modelId }
+    : getEffectiveModelConfig();
+  const configured = Boolean(effectiveConfig);
+  modelConfigStatus.textContent = manualConfigured
+    ? `${manualConfig.modelId}`
+    : effectiveConfig?.source === "openclaw"
+      ? `OpenClaw · ${effectiveConfig.modelId}`
+      : "未配置";
   modelConnectionInline.classList.remove("connection-success", "connection-failed", "connection-unknown");
   modelConnectionInline.classList.add(
     latestModelConnectionState === "success"
@@ -725,16 +843,16 @@ function renderModelConfigStatus(configOverride = null, preserveDraft = false) {
         ? "未配置完整"
         : "未检测";
   if (!preserveDraft) {
-    modelConfigForm.baseUrl.value = config.baseUrl || "";
-    modelConfigForm.modelId.value = config.modelId || "";
-    modelConfigForm.apiKey.value = config.apiKey || "";
+    modelConfigForm.baseUrl.value = manualConfig.baseUrl || "";
+    modelConfigForm.modelId.value = manualConfig.modelId || "";
+    modelConfigForm.apiKey.value = manualConfig.apiKey || "";
   }
   modelTestFeedback.textContent = latestModelConnectionState === "success"
     ? "连接成功"
     : latestModelConnectionState === "failed"
       ? "连接失败"
       : latestModelConnectionState === "missing"
-        ? "缺少 Base URL、模型 ID 或密钥。"
+        ? "缺少 Base URL、模型 ID 或密钥，且未检测到 OpenClaw 默认模型。"
         : "未检测连接状态";
   modelReminder.classList.toggle("hidden", configured);
 }
@@ -751,6 +869,37 @@ function formatDataTimestamp() {
 
 function renderDataTimeNote() {
   dataTimeNote.textContent = `数据时间：${formatDataTimestamp()}。最新数据请刷新数据。`;
+}
+
+async function renderRuntimeStatus() {
+  runtimeOrigin.textContent = window.location.origin;
+  runtimeApiStatus.textContent = "正在检查 API";
+  runtimeNote.classList.remove("runtime-note-success", "runtime-note-error");
+  runtimeNote.classList.add("runtime-note-pending");
+
+  try {
+    const response = await fetch("/api/health", {
+      cache: "no-store",
+      headers: {
+        Accept: "application/json"
+      }
+    });
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    const payload = await response.json();
+    const reportedOrigin = payload.origin || window.location.origin;
+    runtimeOrigin.textContent = reportedOrigin;
+    runtimeApiStatus.textContent = payload.ok
+      ? `API 已连接${payload.port ? `（端口 ${payload.port}）` : ""}`
+      : "API 未就绪";
+    runtimeNote.classList.remove("runtime-note-pending", "runtime-note-error");
+    runtimeNote.classList.add(payload.ok ? "runtime-note-success" : "runtime-note-error");
+  } catch (error) {
+    runtimeApiStatus.textContent = "API 连接失败，请确认打开的是服务实际端口";
+    runtimeNote.classList.remove("runtime-note-pending", "runtime-note-success");
+    runtimeNote.classList.add("runtime-note-error");
+  }
 }
 
 function showAnalysisOverlay() {
@@ -780,7 +929,7 @@ function hideAnalysisOverlay() {
 }
 
 async function resolveInsightForViewModel(viewModel) {
-  const insight = hasModelConfig()
+  const insight = hasEffectiveModelConfig()
     ? await analyzeWithConfiguredModel(viewModel)
     : limitInsightText(viewModel.insight);
   setResolvedInsight(viewModel.state.key, viewModel.persona.key, insight);
@@ -815,7 +964,7 @@ async function warmMapInsights(runId, { overlayVisible = false, totalStates = st
       return;
     }
 
-    const needsRemoteModelAnalysis = hasModelConfig()
+    const needsRemoteModelAnalysis = hasEffectiveModelConfig()
       && !modelInsightCache[buildModelInsightCacheKey(baseViewModel)];
     if (needsRemoteModelAnalysis && !overlayShown) {
       showAnalysisOverlay();
@@ -852,7 +1001,7 @@ function handleStateSelection(stateKey) {
     return;
   }
 
-  if (!hasModelConfig() || isStateResolved(stateKey)) {
+  if (!hasEffectiveModelConfig() || isStateResolved(stateKey)) {
     appState.activeState = stateKey;
     syncView();
     return;
@@ -964,7 +1113,7 @@ function bindRefreshWeather() {
   refreshWeatherButton.addEventListener("click", async () => {
     refreshWeatherButton.disabled = true;
     refreshWeatherButton.textContent = "刷新中...";
-    if (hasModelConfig()) {
+    if (hasEffectiveModelConfig()) {
       await testModelConnection();
       renderModelConfigStatus();
     }
@@ -1314,7 +1463,7 @@ async function syncView({ forceWeather = false, forceTimeSeries = false } = {}) 
   }
 
   let overlayShown = false;
-  const needsRemoteModelAnalysis = hasModelConfig()
+  const needsRemoteModelAnalysis = hasEffectiveModelConfig()
     && !getResolvedInsight(appState.activeState, appState.activePersona)
     && !modelInsightCache[buildModelInsightCacheKey(baseViewModel)];
   if (needsRemoteModelAnalysis) {
@@ -1350,14 +1499,35 @@ async function syncView({ forceWeather = false, forceTimeSeries = false } = {}) 
   }
 }
 
-loadPersistedModelInsightCache();
-renderUsMap();
-createPersonas();
-renderDecisionOutputSummary();
-renderModelConfigStatus();
-renderDataTimeNote();
-bindModelConfig();
-bindCustomPersonaForm();
-bindRefreshWeather();
-bindChartDownloads();
-syncView();
+async function bootstrap() {
+  loadPersistedModelInsightCache();
+  await loadAutoModelConfig();
+  createPersonas();
+  renderDecisionOutputSummary();
+  renderModelConfigStatus();
+  renderDataTimeNote();
+  renderRuntimeStatus();
+  bindModelConfig();
+  bindCustomPersonaForm();
+  bindRefreshWeather();
+  bindChartDownloads();
+
+  try {
+    const mapData = await loadUsaMapData();
+    renderUsMap(mapData);
+  } catch (error) {
+    renderMapLoadError(error instanceof Error ? error.message : "未知错误");
+    throw error;
+  }
+
+  if (hasEffectiveModelConfig()) {
+    await testModelConnection();
+    renderModelConfigStatus();
+  }
+
+  await syncView();
+}
+
+bootstrap().catch((error) => {
+  console.error("App bootstrap failed:", error);
+});

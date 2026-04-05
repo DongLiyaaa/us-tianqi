@@ -87,6 +87,12 @@
         <div class="analysis-overlay hidden" id="analysisOverlay" aria-hidden="true">
           <div class="analysis-overlay-card" id="analysisOverlayText">正在分析 0 / 50</div>
         </div>
+        <div class="runtime-note runtime-note-pending" id="runtimeNote">
+          <span class="runtime-note-label">当前服务</span>
+          <strong id="runtimeOrigin">--</strong>
+          <span class="runtime-note-separator">·</span>
+          <span id="runtimeApiStatus">正在检查 API</span>
+        </div>
         <div class="data-time-note" id="dataTimeNote">数据时间：--。最新数据请刷新数据。</div>
 
         <div class="us-map" id="mapRoot" aria-label="美国天气需求地图">
@@ -285,6 +291,7 @@
           <p class="model-test-feedback" id="modelTestFeedback">未检测连接状态</p>
           <p class="model-config-note">大模型决定分析速度和分析质量</p>
         </div>
+        <p class="model-auto-note">未手动配置时，会自动接入 OpenClaw 已配置的默认模型。</p>
       </form>
     </section>
   </div>

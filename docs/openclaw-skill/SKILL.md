@@ -15,6 +15,7 @@ It is intentionally free of personal paths, local account names, fixed machine p
 - Verify the health endpoint before editing or inspecting behavior
 - Call the local weather and analysis endpoints
 - Keep changes scoped to this repository
+- Let the dashboard automatically reuse the default model already configured in OpenClaw when the user has not manually filled model settings
 
 ## OpenClaw prompt template
 
